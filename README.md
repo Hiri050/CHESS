@@ -1,5 +1,4 @@
 # ♟ Chess
-
 A clean, minimal chess app with a TypeScript/Express backend and vanilla JS frontend.
 
 ## Features
