@@ -1,6 +1,67 @@
 import express from "express";
 import cors from "cors";
 import { Chess, type Move, type Color, type PieceSymbol } from "chess.js";
+import Database from "better-sqlite3";
+import path from "path";
+
+// ─── Database setup ───────────────────────────────────────────────────────────
+const DB_PATH = process.env.DB_PATH ?? path.join(process.cwd(), "chess.db");
+const db = new Database(DB_PATH);
+
+db.exec(`
+  CREATE TABLE IF NOT EXISTS games (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    date        TEXT    NOT NULL,
+    mode        TEXT    NOT NULL,
+    difficulty  TEXT,
+    player_color TEXT,
+    result      TEXT    NOT NULL,
+    result_detail TEXT  NOT NULL,
+    pgn         TEXT    NOT NULL,
+    moves_count INTEGER NOT NULL,
+    duration_seconds INTEGER NOT NULL DEFAULT 0,
+    white_label TEXT    NOT NULL DEFAULT 'White',
+    black_label TEXT    NOT NULL DEFAULT 'Black'
+  );
+`);
+
+// ─── PGN helpers ─────────────────────────────────────────────────────────────
+function buildPGN(params: {
+  whiteLabel: string;
+  blackLabel: string;
+  result: string;
+  date: string;
+  mode: string;
+  difficulty?: string;
+  sanMoves: string[];
+}): string {
+  const resultTag = params.result === "white" ? "1-0"
+    : params.result === "black" ? "0-1"
+    : "1/2-1/2";
+
+  const header = [
+    `[Event "Casual Game"]`,
+    `[Site "Chess App"]`,
+    `[Date "${params.date.replace(/-/g, ".")}"]`,
+    `[White "${params.whiteLabel}"]`,
+    `[Black "${params.blackLabel}"]`,
+    `[Result "${resultTag}"]`,
+    params.mode === "ai" && params.difficulty
+      ? `[Difficulty "${params.difficulty}"]`
+      : null,
+  ]
+    .filter(Boolean)
+    .join("\n");
+
+  // Group SANs into move pairs: "1. e4 e5 2. Nf3 Nc6 ..."
+  let movesStr = "";
+  for (let i = 0; i < params.sanMoves.length; i++) {
+    if (i % 2 === 0) movesStr += `${Math.floor(i / 2) + 1}. `;
+    movesStr += params.sanMoves[i] + " ";
+  }
+
+  return `${header}\n\n${movesStr.trim()} ${resultTag}\n`;
+}
 
 const app = express();
 app.use(cors());
@@ -263,4 +324,128 @@ app.get("/api/new-game", (_req, res) => {
 const PORT = process.env.PORT ?? 3001;
 app.listen(PORT, () => {
   console.log(`♟  Chess AI server running on http://localhost:${PORT}`);
+});
+
+// ─── Game History Routes ─────────────────────────────────────────────────────
+
+// Save a completed game
+app.post("/api/games", (req, res) => {
+  const {
+    mode,
+    difficulty,
+    playerColor,
+    result,
+    resultDetail,
+    sanMoves,
+    durationSeconds = 0,
+  } = req.body as {
+    mode: string;
+    difficulty?: string;
+    playerColor?: string;
+    result: "white" | "black" | "draw";
+    resultDetail: string;
+    sanMoves: string[];
+    durationSeconds?: number;
+  };
+
+  if (!result || !Array.isArray(sanMoves)) {
+    res.status(400).json({ error: "Missing required fields" });
+    return;
+  }
+
+  const now = new Date();
+  const date = now.toISOString().split("T")[0]!;
+
+  const whiteLabel =
+    mode === "ai"
+      ? playerColor === "w" ? "You" : `Computer (${difficulty ?? "medium"})`
+      : "White";
+  const blackLabel =
+    mode === "ai"
+      ? playerColor === "b" ? "You" : `Computer (${difficulty ?? "medium"})`
+      : "Black";
+
+  const pgn = buildPGN({
+    whiteLabel,
+    blackLabel,
+    result,
+    date,
+    mode,
+    difficulty,
+    sanMoves,
+  });
+
+  const stmt = db.prepare(`
+    INSERT INTO games
+      (date, mode, difficulty, player_color, result, result_detail, pgn,
+       moves_count, duration_seconds, white_label, black_label)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+
+  const info = stmt.run(
+    date,
+    mode,
+    difficulty ?? null,
+    playerColor ?? null,
+    result,
+    resultDetail,
+    pgn,
+    sanMoves.length,
+    durationSeconds,
+    whiteLabel,
+    blackLabel
+  );
+
+  res.json({ id: info.lastInsertRowid, pgn });
+});
+
+// List all saved games (newest first)
+app.get("/api/games", (_req, res) => {
+  const rows = db
+    .prepare(
+      `SELECT id, date, mode, difficulty, player_color, result, result_detail,
+              moves_count, duration_seconds, white_label, black_label
+       FROM games ORDER BY id DESC`
+    )
+    .all();
+  res.json({ games: rows });
+});
+
+// Get a single game (with full PGN)
+app.get("/api/games/:id", (req, res) => {
+  const row = db
+    .prepare(`SELECT * FROM games WHERE id = ?`)
+    .get(req.params.id);
+  if (!row) {
+    res.status(404).json({ error: "Game not found" });
+    return;
+  }
+  res.json(row);
+});
+
+// Download PGN file for a game
+app.get("/api/games/:id/pgn", (req, res) => {
+  const row = db
+    .prepare(`SELECT * FROM games WHERE id = ?`)
+    .get(req.params.id) as { pgn: string; date: string; id: number } | undefined;
+  if (!row) {
+    res.status(404).json({ error: "Game not found" });
+    return;
+  }
+  res.setHeader("Content-Type", "application/x-chess-pgn");
+  res.setHeader(
+    "Content-Disposition",
+    `attachment; filename="chess-game-${row.id}-${row.date}.pgn"`
+  );
+  res.send(row.pgn);
+});
+
+// Delete a saved game
+app.delete("/api/games/:id", (req, res) => {
+  const info = db.prepare(`DELETE FROM games WHERE id = ?`).run(req.params.id);
+  if (info.changes === 0) {
+    res.status(404).json({ error: "Game not found" });
+    return;
+  }
+  res.json({ deleted: true });
 });
