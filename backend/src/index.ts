@@ -1,5 +1,7 @@
 import express from "express";
 import cors from "cors";
+import { createServer } from "http";
+import { Server } from "socket.io";
 import { Chess, type Move, type Color, type PieceSymbol } from "chess.js";
 import Database from "better-sqlite3";
 import path from "path";
@@ -64,8 +66,88 @@ function buildPGN(params: {
 }
 
 const app = express();
+const httpServer = createServer(app);
+const io = new Server(httpServer, {
+  cors: { origin: "*", methods: ["GET", "POST"] },
+});
+
 app.use(cors());
 app.use(express.json());
+
+// ─── Multiplayer Room Management ─────────────────────────────────────────────
+interface RoomPlayer { socketId: string; color: "w" | "b"; name: string; }
+interface Room { code: string; players: RoomPlayer[]; fen: string; sanMoves: string[]; startedAt: number; }
+const rooms = new Map<string, Room>();
+
+function generateRoomCode(): string {
+  const chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+  let code = "";
+  for (let i = 0; i < 5; i++) code += chars[Math.floor(Math.random() * chars.length)];
+  return code;
+}
+function getRoomBySocket(socketId: string): Room | undefined {
+  for (const room of rooms.values())
+    if (room.players.some(p => p.socketId === socketId)) return room;
+}
+
+io.on("connection", (socket) => {
+  socket.on("create-room", ({ name }: { name: string }) => {
+    let code = generateRoomCode();
+    while (rooms.has(code)) code = generateRoomCode();
+    const room: Room = {
+      code, players: [{ socketId: socket.id, color: "w", name: name || "Player 1" }],
+      fen: "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+      sanMoves: [], startedAt: Date.now(),
+    };
+    rooms.set(code, room);
+    socket.join(code);
+    socket.emit("room-created", { code, color: "w" });
+  });
+
+  socket.on("join-room", ({ code, name }: { code: string; name: string }) => {
+    const room = rooms.get(code.toUpperCase());
+    if (!room) { socket.emit("join-error", { message: "Room not found. Check the code!" }); return; }
+    if (room.players.length >= 2) { socket.emit("join-error", { message: "Room is full!" }); return; }
+    room.players.push({ socketId: socket.id, color: "b", name: name || "Player 2" });
+    socket.join(code);
+    const white = room.players.find(p => p.color === "w")!;
+    const black = room.players.find(p => p.color === "b")!;
+    socket.emit("game-start", { color: "b", fen: room.fen, opponentName: white.name });
+    io.to(white.socketId).emit("game-start", { color: "w", fen: room.fen, opponentName: black.name });
+  });
+
+  socket.on("online-move", ({ code, from, to, promotion }: { code: string; from: string; to: string; promotion?: string }) => {
+    const room = rooms.get(code);
+    if (!room) return;
+    const player = room.players.find(p => p.socketId === socket.id);
+    if (!player) return;
+    try {
+      const chess = new Chess(room.fen);
+      if (chess.turn() !== player.color) { socket.emit("move-error", { message: "Not your turn!" }); return; }
+      const move = chess.move({ from, to, promotion: promotion ?? "q" });
+      if (!move) { socket.emit("move-error", { message: "Illegal move" }); return; }
+      room.fen = chess.fen();
+      room.sanMoves.push(move.san);
+      const payload = {
+        fen: chess.fen(), move, isCheck: chess.isCheck(),
+        isCheckmate: chess.isCheckmate(), isDraw: chess.isDraw(),
+        isStalemate: chess.isStalemate(), isGameOver: chess.isGameOver(), turn: chess.turn(),
+      };
+      io.to(code).emit("move-made", payload);
+      if (chess.isGameOver()) setTimeout(() => rooms.delete(code), 60000);
+    } catch { socket.emit("move-error", { message: "Invalid move" }); }
+  });
+
+  socket.on("disconnect", () => {
+    const room = getRoomBySocket(socket.id);
+    if (!room) return;
+    const player = room.players.find(p => p.socketId === socket.id);
+    socket.to(room.code).emit("opponent-disconnected", {
+      message: `${player?.name ?? "Your opponent"} disconnected.`,
+    });
+    rooms.delete(room.code);
+  });
+});
 
 // ─── Piece values ────────────────────────────────────────────────────────────
 const PIECE_VALUES: Record<PieceSymbol, number> = {
@@ -303,13 +385,39 @@ app.post("/api/ai-move", (req, res) => {
   }
 });
 
-// Get legal moves for a square
+// Get legal moves for a square (returns rich move info)
 app.post("/api/legal-moves", (req, res) => {
   const { fen, square } = req.body as { fen: string; square: string };
   try {
     const chess = new Chess(fen);
     const moves = chess.moves({ square: square as Parameters<typeof chess.moves>[0]["square"], verbose: true });
-    res.json({ moves: moves.map((m) => m.to) });
+    res.json({
+      moves: moves.map((m) => ({
+        to: m.to,
+        from: m.from,
+        san: m.san,
+        isCapture: !!m.captured,
+        isEnPassant: !!(m.flags && m.flags.includes("e")),
+        isPromotion: !!(m.flags && m.flags.includes("p")),
+        isCastle: !!(m.flags && (m.flags.includes("k") || m.flags.includes("q"))),
+      })),
+    });
+  } catch {
+    res.status(400).json({ error: "Invalid position" });
+  }
+});
+
+// Evaluate current position (for eval bar)
+app.post("/api/evaluate", (req, res) => {
+  const { fen } = req.body as { fen: string };
+  try {
+    const chess = new Chess(fen);
+    const score = evaluate(chess);
+    // Clamp to a reasonable range for display
+    const clamped = Math.max(-2000, Math.min(2000, score));
+    // Convert to "pawns" scale (-20 to +20)
+    const pawns = clamped / 100;
+    res.json({ score, pawns: Math.round(pawns * 10) / 10 });
   } catch {
     res.status(400).json({ error: "Invalid position" });
   }
@@ -321,9 +429,22 @@ app.get("/api/new-game", (_req, res) => {
   res.json({ fen: chess.fen(), turn: "w" });
 });
 
+// Validate a FEN string
+app.post("/api/validate-fen", (req, res) => {
+  const { fen } = req.body as { fen: string };
+  try {
+    const chess = new Chess(fen);
+    res.json({ valid: true, turn: chess.turn() });
+  } catch {
+    res.json({ valid: false });
+  }
+});
+
 const PORT = process.env.PORT ?? 3001;
-app.listen(PORT, () => {
+httpServer.listen(PORT, () => {
   console.log(`♟  Chess AI server running on http://localhost:${PORT}`);
+  console.log(`   Database: ${DB_PATH}`);
+  console.log(`   Multiplayer: Socket.io enabled ✓`);
 });
 
 // ─── Game History Routes ─────────────────────────────────────────────────────
@@ -448,4 +569,42 @@ app.delete("/api/games/:id", (req, res) => {
     return;
   }
   res.json({ deleted: true });
+});
+
+// Get player stats summary
+app.get("/api/stats", (_req, res) => {
+  const total = db.prepare(`SELECT COUNT(*) as count FROM games`).get() as { count: number };
+  const wins = db.prepare(
+    `SELECT COUNT(*) as count FROM games
+     WHERE (result = 'white' AND player_color = 'w')
+        OR (result = 'black' AND player_color = 'b')`
+  ).get() as { count: number };
+  const losses = db.prepare(
+    `SELECT COUNT(*) as count FROM games
+     WHERE (result = 'white' AND player_color = 'b')
+        OR (result = 'black' AND player_color = 'w')`
+  ).get() as { count: number };
+  const draws = db.prepare(
+    `SELECT COUNT(*) as count FROM games WHERE result = 'draw'`
+  ).get() as { count: number };
+  const avgMoves = db.prepare(
+    `SELECT AVG(moves_count) as avg FROM games`
+  ).get() as { avg: number | null };
+  const avgDuration = db.prepare(
+    `SELECT AVG(duration_seconds) as avg FROM games`
+  ).get() as { avg: number | null };
+  const longestGame = db.prepare(
+    `SELECT MAX(moves_count) as max FROM games`
+  ).get() as { max: number | null };
+
+  res.json({
+    total: total.count,
+    wins: wins.count,
+    losses: losses.count,
+    draws: draws.count,
+    avgMoves: Math.round(avgMoves.avg ?? 0),
+    avgDuration: Math.round(avgDuration.avg ?? 0),
+    longestGame: longestGame.max ?? 0,
+    winRate: total.count > 0 ? Math.round((wins.count / total.count) * 100) : 0,
+  });
 });
